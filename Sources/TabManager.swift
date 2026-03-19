@@ -2726,8 +2726,9 @@ class TabManager: ObservableObject {
         return trimmed
     }
 
-    func closeWorkspace(_ workspace: Workspace) {
-        guard tabs.count > 1 else { return }
+    /// Performs the actual close of a single workspace without guard checks or selection updates.
+    /// Callers are responsible for ensuring enough tabs remain and for updating selection afterward.
+    private func closeWorkspaceInternal(_ workspace: Workspace) {
         sentryBreadcrumb("workspace.close", data: ["tabCount": tabs.count - 1])
         clearWorkspaceGitProbes(workspaceId: workspace.id)
         sidebarSelectedWorkspaceIds.remove(workspace.id)
@@ -2738,16 +2739,39 @@ class TabManager: ObservableObject {
         unwireClosedBrowserTracking(for: workspace)
         workspace.owningTabManager = nil
 
-        if let index = tabs.firstIndex(where: { $0.id == workspace.id }) {
-            tabs.remove(at: index)
+        tabs.removeAll { $0.id == workspace.id }
+    }
 
-            if selectedTabId == workspace.id {
-                // Keep the "focused index" stable when possible:
-                // - If we closed workspace i and there is still a workspace at index i, focus it (the one that moved up).
-                // - Otherwise (we closed the last workspace), focus the new last workspace (i-1).
-                let newIndex = min(index, max(0, tabs.count - 1))
-                selectedTabId = tabs[newIndex].id
-            }
+    /// Selects the nearest remaining workspace after a close operation.
+    /// Picks the workspace at the given hint index (clamped to bounds).
+    private func selectNearestWorkspace(hintIndex: Int = 0) {
+        guard !tabs.isEmpty else { return }
+        let newIndex = min(hintIndex, max(0, tabs.count - 1))
+        selectedTabId = tabs[newIndex].id
+    }
+
+    func closeWorkspace(_ workspace: Workspace) {
+        let kids = children(of: workspace)
+        let totalToClose = 1 + kids.count
+        guard tabs.count > totalToClose else { return }
+
+        // Remember if we need to update selection after all removals
+        let needsSelectionUpdate = workspace.id == selectedTabId ||
+            kids.contains(where: { $0.id == selectedTabId })
+
+        // Capture the index before any removals so we can pick a sensible replacement
+        let hintIndex = tabs.firstIndex(where: { $0.id == workspace.id }) ?? 0
+
+        // Close children first (no selection update per child)
+        for child in kids {
+            closeWorkspaceInternal(child)
+        }
+        // Then close the parent
+        closeWorkspaceInternal(workspace)
+
+        // Update selection once, after all removals
+        if needsSelectionUpdate {
+            selectNearestWorkspace(hintIndex: hintIndex)
         }
     }
 
@@ -2919,6 +2943,27 @@ class TabManager: ObservableObject {
 
     @discardableResult
     func closeWorkspaceWithConfirmation(_ workspace: Workspace) -> Bool {
+        // Cascade close: if the workspace has nested children, confirm as a group.
+        let kids = children(of: workspace)
+        if !kids.isEmpty {
+            let childCount = kids.count
+            let willCloseWindow = tabs.count <= 1 + childCount
+            guard confirmClose(
+                title: String(localized: "workspace.close.nestedConfirmation.title", defaultValue: "Close workspace?"),
+                message: String(localized: "workspace.close.nestedConfirmation", defaultValue: "Close workspace and \(childCount) nested workspace(s)?"),
+                acceptCmdD: willCloseWindow
+            ) else { return false }
+            if willCloseWindow {
+                if let window {
+                    window.performClose(nil)
+                } else {
+                    AppDelegate.shared?.closeMainWindowContainingTabId(workspace.id)
+                }
+            } else {
+                closeWorkspace(workspace)
+            }
+            return true
+        }
         if workspace.isPinned {
             guard confirmClose(
                 title: String(localized: "dialog.closePinnedWorkspace.title", defaultValue: "Close pinned workspace?"),
@@ -2949,7 +2994,18 @@ class TabManager: ObservableObject {
     }
 
     func closeWorkspacesWithConfirmation(_ workspaceIds: [UUID], allowPinned: Bool) {
-        let workspaces = orderedClosableWorkspaces(workspaceIds, allowPinned: allowPinned)
+        // Expand the selection to include children of any selected parent workspace
+        var expandedIds = workspaceIds
+        for id in workspaceIds {
+            guard let workspace = tabs.first(where: { $0.id == id }) else { continue }
+            for child in children(of: workspace) {
+                if !expandedIds.contains(child.id) {
+                    expandedIds.append(child.id)
+                }
+            }
+        }
+
+        let workspaces = orderedClosableWorkspaces(expandedIds, allowPinned: allowPinned)
         guard !workspaces.isEmpty else { return }
         guard workspaces.count > 1 else {
             closeWorkspaceWithConfirmation(workspaces[0])
