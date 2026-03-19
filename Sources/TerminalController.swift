@@ -4056,8 +4056,20 @@ class TerminalController {
                     result = .err(code: "not_found", message: "Workspace not found", data: nil)
                     return
                 }
-                let candidates = Array(tabManager.tabs.prefix(index)).filter { !$0.isPinned }
-                let closed = closeWorkspaces(candidates)
+                let aboveCandidates = Array(tabManager.tabs.prefix(index)).filter { !$0.isPinned }
+                // Include children of any parent candidates that aren't already in the list,
+                // so that closing a parent also closes its children regardless of position.
+                var expandedAbove: [Workspace] = []
+                let aboveCandidateIds = Set(aboveCandidates.map(\.id))
+                for candidate in aboveCandidates {
+                    expandedAbove.append(candidate)
+                    if candidate.isTopLevel {
+                        for child in tabManager.children(of: candidate) where !aboveCandidateIds.contains(child.id) {
+                            expandedAbove.append(child)
+                        }
+                    }
+                }
+                let closed = closeWorkspaces(expandedAbove)
                 finish(["closed": closed])
 
             case "close_below":
@@ -4065,13 +4077,25 @@ class TerminalController {
                     result = .err(code: "not_found", message: "Workspace not found", data: nil)
                     return
                 }
-                let candidates: [Workspace]
+                let belowCandidates: [Workspace]
                 if index + 1 < tabManager.tabs.count {
-                    candidates = Array(tabManager.tabs.suffix(from: index + 1)).filter { !$0.isPinned }
+                    belowCandidates = Array(tabManager.tabs.suffix(from: index + 1)).filter { !$0.isPinned }
                 } else {
-                    candidates = []
+                    belowCandidates = []
                 }
-                let closed = closeWorkspaces(candidates)
+                // Include children of any parent candidates that aren't already in the list,
+                // so that closing a parent also closes its children regardless of position.
+                var expandedBelow: [Workspace] = []
+                let belowCandidateIds = Set(belowCandidates.map(\.id))
+                for candidate in belowCandidates {
+                    expandedBelow.append(candidate)
+                    if candidate.isTopLevel {
+                        for child in tabManager.children(of: candidate) where !belowCandidateIds.contains(child.id) {
+                            expandedBelow.append(child)
+                        }
+                    }
+                }
+                let closed = closeWorkspaces(expandedBelow)
                 finish(["closed": closed])
 
             case "mark_read":
