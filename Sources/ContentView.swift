@@ -8537,53 +8537,48 @@ struct VerticalTabsSidebar: View {
 
                         LazyVStack(spacing: tabRowSpacing) {
                             ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                                let selectedContextIds: Set<UUID> = selectedTabIds.contains(tab.id) ? selectedTabIds : [tab.id]
-                                let contextTargetIds = tabManager.tabs.compactMap { workspace in
-                                    selectedContextIds.contains(workspace.id) ? workspace.id : nil
-                                }
-                                let remoteContextMenuTargets = tabManager.tabs.filter { workspace in
-                                    contextTargetIds.contains(workspace.id) && workspace.isRemoteWorkspace
-                                }
-                                let topLevelIndex = topLevelIds.firstIndex(of: tab.id)
-                                let shortcutDigit: Int? = topLevelIndex.flatMap {
-                                    WorkspaceShortcutMapper.commandDigitForWorkspace(
-                                        at: $0,
-                                        workspaceCount: topLevelIds.count
+                                // Skip children — they are rendered inside their parent's group container
+                                if tab.isChild {
+                                    EmptyView()
+                                } else if tabManager.hasChildren(tab) {
+                                    // Group container: parent + indented children
+                                    let childWorkspaces = tabManager.children(of: tab)
+                                    VStack(spacing: tabRowSpacing) {
+                                        sidebarTabItemView(
+                                            tab: tab,
+                                            index: index,
+                                            topLevelIds: topLevelIds,
+                                            workspaceCount: workspaceCount,
+                                            canCloseWorkspace: canCloseWorkspace
+                                        )
+                                        ForEach(childWorkspaces, id: \.id) { child in
+                                            if let childIndex = tabManager.tabs.firstIndex(where: { $0.id == child.id }) {
+                                                sidebarTabItemView(
+                                                    tab: child,
+                                                    index: childIndex,
+                                                    topLevelIds: topLevelIds,
+                                                    workspaceCount: workspaceCount,
+                                                    canCloseWorkspace: canCloseWorkspace
+                                                )
+                                                .padding(.leading, 20)
+                                            }
+                                        }
+                                    }
+                                    .padding(4)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(Color.primary.opacity(0.04))
+                                    )
+                                } else {
+                                    // Standalone workspace — render as-is
+                                    sidebarTabItemView(
+                                        tab: tab,
+                                        index: index,
+                                        topLevelIds: topLevelIds,
+                                        workspaceCount: workspaceCount,
+                                        canCloseWorkspace: canCloseWorkspace
                                     )
                                 }
-                                TabItemView(
-                                    tabManager: tabManager,
-                                    notificationStore: notificationStore,
-                                    tab: tab,
-                                    index: index,
-                                    isActive: tabManager.selectedTabId == tab.id,
-                                    workspaceShortcutDigit: shortcutDigit,
-                                    workspaceShortcutModifierSymbol: workspaceNumberShortcut.modifierDisplayString,
-                                    canCloseWorkspace: canCloseWorkspace,
-                                    accessibilityWorkspaceCount: workspaceCount,
-                                    unreadCount: notificationStore.unreadCount(forTabId: tab.id),
-                                    latestNotificationText: {
-                                        guard showsSidebarNotificationMessage,
-                                              let notification = notificationStore.latestNotification(forTabId: tab.id) else {
-                                            return nil
-                                        }
-                                        let text = notification.body.isEmpty ? notification.title : notification.body
-                                        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        return trimmed.isEmpty ? nil : trimmed
-                                    }(),
-                                    rowSpacing: tabRowSpacing,
-                                    setSelectionToTabs: { selection = .tabs },
-                                    selectedTabIds: $selectedTabIds,
-                                    lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                                    showsModifierShortcutHints: modifierKeyMonitor.isModifierPressed,
-                                    dragAutoScrollController: dragAutoScrollController,
-                                    draggedTabId: $draggedTabId,
-                                    dropIndicator: $dropIndicator,
-                                    remoteContextMenuWorkspaceIds: remoteContextMenuTargets.map(\.id),
-                                    allRemoteContextMenuTargetsConnecting: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .connecting },
-                                    allRemoteContextMenuTargetsDisconnected: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .disconnected }
-                                )
-                                .equatable()
                             }
                         }
                         .padding(.vertical, 8)
@@ -8687,6 +8682,64 @@ struct VerticalTabsSidebar: View {
             draggedTabId = nil
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// Builds a single `TabItemView` row for the sidebar. Extracted to avoid duplicating
+    /// the initializer across standalone, parent, and child workspace rendering paths.
+    @ViewBuilder
+    private func sidebarTabItemView(
+        tab: Tab,
+        index: Int,
+        topLevelIds: [UUID],
+        workspaceCount: Int,
+        canCloseWorkspace: Bool
+    ) -> some View {
+        let selectedContextIds: Set<UUID> = selectedTabIds.contains(tab.id) ? selectedTabIds : [tab.id]
+        let contextTargetIds = tabManager.tabs.compactMap { workspace in
+            selectedContextIds.contains(workspace.id) ? workspace.id : nil
+        }
+        let remoteContextMenuTargets = tabManager.tabs.filter { workspace in
+            contextTargetIds.contains(workspace.id) && workspace.isRemoteWorkspace
+        }
+        let topLevelIndex = topLevelIds.firstIndex(of: tab.id)
+        let shortcutDigit: Int? = topLevelIndex.flatMap {
+            WorkspaceShortcutMapper.commandDigitForWorkspace(
+                at: $0,
+                workspaceCount: topLevelIds.count
+            )
+        }
+        TabItemView(
+            tabManager: tabManager,
+            notificationStore: notificationStore,
+            tab: tab,
+            index: index,
+            isActive: tabManager.selectedTabId == tab.id,
+            workspaceShortcutDigit: shortcutDigit,
+            canCloseWorkspace: canCloseWorkspace,
+            accessibilityWorkspaceCount: workspaceCount,
+            unreadCount: notificationStore.unreadCount(forTabId: tab.id),
+            latestNotificationText: {
+                guard showsSidebarNotificationMessage,
+                      let notification = notificationStore.latestNotification(forTabId: tab.id) else {
+                    return nil
+                }
+                let text = notification.body.isEmpty ? notification.title : notification.body
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }(),
+            rowSpacing: tabRowSpacing,
+            setSelectionToTabs: { selection = .tabs },
+            selectedTabIds: $selectedTabIds,
+            lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+            showsModifierShortcutHints: modifierKeyMonitor.isModifierPressed,
+            dragAutoScrollController: dragAutoScrollController,
+            draggedTabId: $draggedTabId,
+            dropIndicator: $dropIndicator,
+            remoteContextMenuWorkspaceIds: remoteContextMenuTargets.map(\.id),
+            allRemoteContextMenuTargetsConnecting: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .connecting },
+            allRemoteContextMenuTargetsDisconnected: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .disconnected }
+        )
+        .equatable()
     }
 
     private func debugShortSidebarTabId(_ id: UUID?) -> String {
