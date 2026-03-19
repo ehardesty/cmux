@@ -1020,7 +1020,8 @@ struct cmuxApp: App {
     }
 
     private func toggleSelectedWorkspacePinned(in manager: TabManager) {
-        guard let workspace = manager.selectedWorkspace else { return }
+        // If selected workspace is a child, don't allow pin toggle
+        guard let workspace = manager.selectedWorkspace, workspace.isTopLevel else { return }
         manager.setPinned(workspace, pinned: !workspace.isPinned)
     }
 
