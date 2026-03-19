@@ -7232,8 +7232,19 @@ struct ContentView: View {
 
     private func closeOtherSelectedWorkspaces() {
         guard let workspace = tabManager.selectedWorkspace else { return }
-        let workspaceIds = tabManager.tabs.compactMap { $0.id == workspace.id ? nil : $0.id }
-        closeWorkspaceIds(workspaceIds, allowPinned: true)
+        // Start by excluding the selected workspace itself.
+        var excludeIds: Set<UUID> = [workspace.id]
+        // If the selected workspace is a child, also exclude its parent and siblings so that
+        // expandWithChildren (called inside closeWorkspacesWithConfirmation) does not pull the
+        // child back into the close set via its parent.
+        if let parentWorkspace = tabManager.parent(of: workspace) {
+            excludeIds.insert(parentWorkspace.id)
+            for sibling in tabManager.children(of: parentWorkspace) {
+                excludeIds.insert(sibling.id)
+            }
+        }
+        let workspaceIds = tabManager.tabs.compactMap { excludeIds.contains($0.id) ? nil : $0.id }
+        closeWorkspaceIds(workspaceIds, allowPinned: false)
     }
 
     private func closeSelectedWorkspacesBelow() {
@@ -13380,8 +13391,14 @@ private struct SidebarTabDropDelegate: DropDelegate {
                     "from=\(fromIndex) to=\(targetIndex) groupStart=\(groupStart) groupEnd=\(groupEnd)"
                 )
 #endif
-                tabManager.unnestWorkspace(draggedWorkspace)
-                // Reorder to desired position after un-nesting (tabs array has changed)
+                // Capture parent before clearing the relationship.
+                let formerParent = tabManager.parent(of: draggedWorkspace)
+                // Clear the parent relationship without mutating the tabs array, so
+                // targetIndex stays valid for the subsequent reorder call.
+                draggedWorkspace.parentWorkspaceId = nil
+                if let formerParent {
+                    draggedWorkspace.isPinned = formerParent.isPinned
+                }
                 _ = tabManager.reorderWorkspace(tabId: draggedTabId, toIndex: targetIndex)
                 if let selectedId = tabManager.selectedTabId {
                     selectedTabIds = [selectedId]
