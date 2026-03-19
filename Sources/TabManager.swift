@@ -2468,16 +2468,34 @@ class TabManager: ObservableObject {
 
     @discardableResult
     func reorderWorkspace(tabId: UUID, toIndex targetIndex: Int) -> Bool {
-        guard let currentIndex = tabs.firstIndex(where: { $0.id == tabId }) else { return false }
-        if tabs.count <= 1 { return true }
+        guard let workspace = tabs.first(where: { $0.id == tabId }) else { return false }
 
-        let workspace = tabs[currentIndex]
-        let clamped = clampedReorderIndex(for: workspace, targetIndex: targetIndex)
-        if currentIndex == clamped { return true }
-
-        tabs.remove(at: currentIndex)
-        tabs.insert(workspace, at: clamped)
-        return true
+        if workspace.isChild {
+            guard let parentId = workspace.parentWorkspaceId,
+                  let parentIndex = tabs.firstIndex(where: { $0.id == parentId }) else { return false }
+            let siblings = children(of: tabs[parentIndex])
+            let minIndex = parentIndex + 1
+            let maxIndex = parentIndex + siblings.count
+            let clampedTarget = min(max(targetIndex, minIndex), maxIndex)
+            guard let currentIndex = tabs.firstIndex(where: { $0.id == tabId }),
+                  currentIndex != clampedTarget else { return false }
+            tabs.remove(at: currentIndex)
+            let insertAt = min(clampedTarget, tabs.count)
+            tabs.insert(workspace, at: insertAt)
+            return true
+        } else if hasChildren(workspace) {
+            let clamped = clampedReorderIndex(for: workspace, targetIndex: targetIndex)
+            moveGroup(workspaceId: tabId, toIndex: clamped)
+            return true
+        } else {
+            let clamped = clampedReorderIndex(for: workspace, targetIndex: targetIndex)
+            guard let currentIndex = tabs.firstIndex(where: { $0.id == tabId }),
+                  currentIndex != clamped else { return false }
+            tabs.remove(at: currentIndex)
+            let insertAt = min(clamped, tabs.count)
+            tabs.insert(workspace, at: insertAt)
+            return true
+        }
     }
 
     @discardableResult
@@ -2559,17 +2577,20 @@ class TabManager: ObservableObject {
     }
 
     func setPinned(_ tab: Workspace, pinned: Bool) {
-        guard tab.isPinned != pinned else { return }
+        guard tab.isTopLevel else { return }
         tab.isPinned = pinned
+        for child in children(of: tab) {
+            child.isPinned = pinned
+        }
         reorderTabForPinnedState(tab)
     }
 
     private func reorderTabForPinnedState(_ tab: Workspace) {
-        guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
-        tabs.remove(at: index)
-        let pinnedCount = tabs.filter { $0.isPinned }.count
-        let insertIndex = min(pinnedCount, tabs.count)
-        tabs.insert(tab, at: insertIndex)
+        let group = workspaceGroup(tab)
+        let groupIds = Set(group.map(\.id))
+        tabs.removeAll { groupIds.contains($0.id) }
+        let pinnedCount = tabs.filter(\.isPinned).count
+        tabs.insert(contentsOf: group, at: pinnedCount)
     }
 
     private func clampedReorderIndex(for workspace: Workspace, targetIndex: Int) -> Int {
@@ -2677,8 +2698,17 @@ class TabManager: ObservableObject {
 
     /// Detach a workspace from this window without closing its panels.
     /// Used by the socket API for cross-window moves.
+    /// If the workspace is a child, clears its parentWorkspaceId before detaching.
+    /// If the workspace is a parent with children, use detachWorkspaceGroup to detach the full group.
     @discardableResult
     func detachWorkspace(tabId: UUID) -> Workspace? {
+        guard let workspace = tabs.first(where: { $0.id == tabId }) else { return nil }
+
+        // If this is a child, clear its parent relationship before detaching
+        if workspace.isChild {
+            workspace.parentWorkspaceId = nil
+        }
+
         guard let index = tabs.firstIndex(where: { $0.id == tabId }) else { return nil }
         clearWorkspaceGitProbes(workspaceId: tabId)
         sidebarSelectedWorkspaceIds.remove(tabId)
@@ -2702,8 +2732,56 @@ class TabManager: ObservableObject {
         return removed
     }
 
+    /// Detach a parent workspace and all its children from this window without closing panels.
+    /// Children retain their parentWorkspaceId so they can be re-attached as a group.
+    /// Returns the parent followed by its children in order, or nil if the workspace is not found.
+    @discardableResult
+    func detachWorkspaceGroup(tabId: UUID) -> [Workspace]? {
+        guard let workspace = tabs.first(where: { $0.id == tabId }) else { return nil }
+        // Resolve to effective parent if called with a child id
+        let effectiveParent: Workspace
+        if workspace.isChild {
+            guard let parentId = workspace.parentWorkspaceId,
+                  let parent = tabs.first(where: { $0.id == parentId }) else { return nil }
+            effectiveParent = parent
+        } else {
+            effectiveParent = workspace
+        }
+
+        let group = workspaceGroup(effectiveParent)
+        var detachedGroup: [Workspace] = []
+        var firstRemovedIndex: Int? = nil
+
+        for member in group {
+            guard let index = tabs.firstIndex(where: { $0.id == member.id }) else { continue }
+            if firstRemovedIndex == nil { firstRemovedIndex = index }
+            clearWorkspaceGitProbes(workspaceId: member.id)
+            sidebarSelectedWorkspaceIds.remove(member.id)
+            tabs.remove(at: tabs.firstIndex(where: { $0.id == member.id })!)
+            unwireClosedBrowserTracking(for: member)
+            member.owningTabManager = nil
+            lastFocusedPanelByTab.removeValue(forKey: member.id)
+            detachedGroup.append(member)
+        }
+
+        if tabs.isEmpty {
+            _ = addWorkspace()
+            return detachedGroup
+        }
+
+        let groupIds = Set(group.map(\.id))
+        if let selectedId = selectedTabId, groupIds.contains(selectedId) {
+            let fallbackIndex = min(firstRemovedIndex ?? 0, max(0, tabs.count - 1))
+            selectedTabId = tabs[fallbackIndex].id
+        }
+
+        return detachedGroup
+    }
+
     /// Attach an existing workspace to this window.
-    func attachWorkspace(_ workspace: Workspace, at index: Int? = nil, select: Bool = true) {
+    /// If the workspace is a parent with pending children (identified by parentWorkspaceId pointing to it),
+    /// pass those children via the pendingChildren parameter to attach them immediately after.
+    func attachWorkspace(_ workspace: Workspace, at index: Int? = nil, select: Bool = true, pendingChildren: [Workspace] = []) {
         workspace.owningTabManager = self
         wireClosedBrowserTracking(for: workspace)
         let insertIndex: Int = {
@@ -2711,6 +2789,15 @@ class TabManager: ObservableObject {
             return max(0, min(index, tabs.count))
         }()
         tabs.insert(workspace, at: insertIndex)
+
+        // Attach children immediately after the parent in order
+        for (offset, child) in pendingChildren.enumerated() {
+            child.owningTabManager = self
+            wireClosedBrowserTracking(for: child)
+            let childIndex = min(insertIndex + 1 + offset, tabs.count)
+            tabs.insert(child, at: childIndex)
+        }
+
         if select {
             selectedTabId = workspace.id
         }
