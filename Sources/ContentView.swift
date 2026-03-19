@@ -12753,6 +12753,7 @@ enum SidebarDropPlanner {
         targetTabId: UUID?,
         tabIds: [UUID],
         pinnedTabIds: Set<UUID>,
+        parentIds: [UUID: UUID] = [:],
         pointerY: CGFloat? = nil,
         targetHeight: CGFloat? = nil
     ) -> SidebarDropIndicator? {
@@ -12777,7 +12778,8 @@ enum SidebarDropPlanner {
             draggedTabId: draggedTabId,
             proposedInsertionPosition: insertionPosition,
             tabIds: tabIds,
-            pinnedTabIds: pinnedTabIds
+            pinnedTabIds: pinnedTabIds,
+            parentIds: parentIds
         )
         let legalTargetIndex = resolvedTargetIndex(
             from: fromIndex,
@@ -12793,7 +12795,8 @@ enum SidebarDropPlanner {
         targetTabId: UUID?,
         indicator: SidebarDropIndicator?,
         tabIds: [UUID],
-        pinnedTabIds: Set<UUID>
+        pinnedTabIds: Set<UUID>,
+        parentIds: [UUID: UUID] = [:]
     ) -> Int? {
         guard let fromIndex = tabIds.firstIndex(of: draggedTabId) else { return nil }
 
@@ -12814,7 +12817,8 @@ enum SidebarDropPlanner {
             draggedTabId: draggedTabId,
             proposedInsertionPosition: insertionPosition,
             tabIds: tabIds,
-            pinnedTabIds: pinnedTabIds
+            pinnedTabIds: pinnedTabIds,
+            parentIds: parentIds
         )
         return resolvedTargetIndex(from: fromIndex, insertionPosition: legalInsertionPosition, totalCount: tabIds.count)
     }
@@ -12844,22 +12848,116 @@ enum SidebarDropPlanner {
         draggedTabId: UUID,
         proposedInsertionPosition: Int,
         tabIds: [UUID],
-        pinnedTabIds: Set<UUID>
+        pinnedTabIds: Set<UUID>,
+        parentIds: [UUID: UUID] = [:]
     ) -> Int {
-        let clampedInsertion = max(0, min(proposedInsertionPosition, tabIds.count))
-        guard !pinnedTabIds.isEmpty else { return clampedInsertion }
+        var position = max(0, min(proposedInsertionPosition, tabIds.count))
 
-        let pinnedCount = tabIds.reduce(into: 0) { count, tabId in
-            if pinnedTabIds.contains(tabId) {
-                count += 1
+        // Enforce pinned/unpinned boundary
+        if !pinnedTabIds.isEmpty {
+            let pinnedCount = tabIds.reduce(into: 0) { count, tabId in
+                if pinnedTabIds.contains(tabId) { count += 1 }
+            }
+            if pinnedCount > 0 {
+                if pinnedTabIds.contains(draggedTabId) {
+                    position = min(position, pinnedCount)
+                } else {
+                    position = max(position, pinnedCount)
+                }
             }
         }
-        guard pinnedCount > 0 else { return clampedInsertion }
 
-        if pinnedTabIds.contains(draggedTabId) {
-            return min(clampedInsertion, pinnedCount)
+        // Enforce group boundary constraints
+        let draggedParentId = parentIds[draggedTabId]
+        let draggedIsParent = tabIds.contains { parentIds[$0] == draggedTabId }
+
+        if draggedIsParent {
+            // Dragging a parent: prevent drop inside another group's children range.
+            // A position is illegal if it lands between a parent and one of its children.
+            // Specifically: if position p is between parentIndex+1 and parentIndex+childCount
+            // for some OTHER group, push to just before that group's parent or after the last child.
+            position = groupBoundaryClampedPosition(
+                position: position,
+                draggedTabId: draggedTabId,
+                tabIds: tabIds,
+                parentIds: parentIds
+            )
+        } else if let parentId = draggedParentId {
+            // Dragging a child: allow reorder within siblings range or un-nesting outside.
+            // We don't restrict to siblings here — `performDrop` handles un-nesting.
+            // However, we must prevent inserting between a different group's parent and its children.
+            position = groupBoundaryClampedPosition(
+                position: position,
+                draggedTabId: draggedTabId,
+                tabIds: tabIds,
+                parentIds: parentIds,
+                ownParentId: parentId
+            )
         }
-        return max(clampedInsertion, pinnedCount)
+
+        return position
+    }
+
+    /// Adjusts a proposed insertion position so it does not split another group's parent/children range.
+    /// When `ownParentId` is provided, positions within the dragged item's own sibling range are allowed as-is.
+    private static func groupBoundaryClampedPosition(
+        position: Int,
+        draggedTabId: UUID,
+        tabIds: [UUID],
+        parentIds: [UUID: UUID],
+        ownParentId: UUID? = nil
+    ) -> Int {
+        // Enumerate all parent/group boundaries in the tab list
+        var i = 0
+        while i < tabIds.count {
+            let tabId = tabIds[i]
+            // Only process parents of other groups (not the dragged item itself, not ownParentId's group)
+            let isParent = tabIds.contains { parentIds[$0] == tabId }
+            guard isParent, tabId != draggedTabId else {
+                i += 1
+                continue
+            }
+
+            // Find contiguous children immediately after this parent
+            var childCount = 0
+            var j = i + 1
+            while j < tabIds.count, parentIds[tabIds[j]] == tabId {
+                childCount += 1
+                j += 1
+            }
+
+            guard childCount > 0 else {
+                i += 1
+                continue
+            }
+
+            let groupStart = i       // index of parent
+            let groupEnd = i + childCount  // index of last child (inclusive)
+
+            // If this is the dragged item's own parent group, don't restrict within it
+            if let ownParentId, tabId == ownParentId {
+                i = j
+                continue
+            }
+
+            // The forbidden insertion range is (groupStart, groupEnd]: between parent and its children.
+            // Insertion at groupStart (before parent) is OK.
+            // Insertion at groupStart+1 through groupEnd is forbidden (splits parent from children).
+            // Insertion at groupEnd+1 (after last child) is OK.
+            if position > groupStart && position <= groupEnd {
+                // Snap to nearest legal boundary: before the group or after the group
+                let distToBefore = position - groupStart
+                let distToAfter = (groupEnd + 1) - position
+                if distToBefore <= distToAfter {
+                    return groupStart
+                } else {
+                    return groupEnd + 1
+                }
+            }
+
+            i = j
+        }
+        return position
     }
 
     static func edgeForPointer(locationY: CGFloat, targetHeight: CGFloat) -> SidebarDropEdge {
@@ -13239,13 +13337,16 @@ private struct SidebarTabDropDelegate: DropDelegate {
 #endif
             return false
         }
-        let tabIds = tabManager.tabs.map(\.id)
+        let tabs = tabManager.tabs
+        let tabIds = tabs.map(\.id)
+        let parentIds = parentIdsMap(from: tabs)
         guard let targetIndex = SidebarDropPlanner.targetIndex(
             draggedTabId: draggedTabId,
             targetTabId: targetTabId,
             indicator: dropIndicator,
             tabIds: tabIds,
-            pinnedTabIds: Set(tabManager.tabs.filter(\.isPinned).map(\.id))
+            pinnedTabIds: Set(tabs.filter(\.isPinned).map(\.id)),
+            parentIds: parentIds
         ) else {
 #if DEBUG
             dlog(
@@ -13264,6 +13365,37 @@ private struct SidebarTabDropDelegate: DropDelegate {
             return true
         }
 
+        // Detect if a child workspace is being dropped outside its parent's group range,
+        // which means the user intends to un-nest it.
+        if let draggedWorkspace = tabs.first(where: { $0.id == draggedTabId }),
+           draggedWorkspace.isChild,
+           let parentId = draggedWorkspace.parentWorkspaceId,
+           let parentIndex = tabIds.firstIndex(of: parentId) {
+            let siblings = tabs.filter { $0.parentWorkspaceId == parentId }
+            let groupStart = parentIndex + 1
+            let groupEnd = parentIndex + siblings.count
+            let isOutsideGroup = targetIndex < groupStart || targetIndex > groupEnd
+            if isOutsideGroup {
+#if DEBUG
+                dlog(
+                    "sidebar.drop.unnest tab=\(draggedTabId.uuidString.prefix(5)) " +
+                    "from=\(fromIndex) to=\(targetIndex) groupStart=\(groupStart) groupEnd=\(groupEnd)"
+                )
+#endif
+                tabManager.unnestWorkspace(draggedWorkspace)
+                // Reorder to desired position after un-nesting (tabs array has changed)
+                _ = tabManager.reorderWorkspace(tabId: draggedTabId, toIndex: targetIndex)
+                if let selectedId = tabManager.selectedTabId {
+                    selectedTabIds = [selectedId]
+                    syncSidebarSelection(preferredSelectedTabId: selectedId)
+                } else {
+                    selectedTabIds = []
+                    syncSidebarSelection()
+                }
+                return true
+            }
+        }
+
 #if DEBUG
         dlog("sidebar.drop.commit tab=\(draggedTabId.uuidString.prefix(5)) from=\(fromIndex) to=\(targetIndex)")
 #endif
@@ -13279,16 +13411,29 @@ private struct SidebarTabDropDelegate: DropDelegate {
     }
 
     private func updateDropIndicator(for info: DropInfo) {
-        let tabIds = tabManager.tabs.map(\.id)
-        let pinnedTabIds = Set(tabManager.tabs.filter(\.isPinned).map(\.id))
+        let tabs = tabManager.tabs
+        let tabIds = tabs.map(\.id)
+        let pinnedTabIds = Set(tabs.filter(\.isPinned).map(\.id))
+        let parentIds = parentIdsMap(from: tabs)
         dropIndicator = SidebarDropPlanner.indicator(
             draggedTabId: draggedTabId,
             targetTabId: targetTabId,
             tabIds: tabIds,
             pinnedTabIds: pinnedTabIds,
+            parentIds: parentIds,
             pointerY: targetTabId == nil ? nil : info.location.y,
             targetHeight: targetRowHeight
         )
+    }
+
+    private func parentIdsMap(from tabs: [Workspace]) -> [UUID: UUID] {
+        var map: [UUID: UUID] = [:]
+        for tab in tabs {
+            if let parentId = tab.parentWorkspaceId {
+                map[tab.id] = parentId
+            }
+        }
+        return map
     }
 
     private func syncSidebarSelection(preferredSelectedTabId: UUID? = nil) {
