@@ -8525,6 +8525,7 @@ struct VerticalTabsSidebar: View {
         let workspaceCount = tabManager.tabs.count
         let canCloseWorkspace = workspaceCount > 1
         let workspaceNumberShortcut = self.workspaceNumberShortcut
+        let topLevelIds = tabManager.topLevelWorkspaces().map(\.id)
 
         VStack(spacing: 0) {
             GeometryReader { proxy in
@@ -8543,16 +8544,20 @@ struct VerticalTabsSidebar: View {
                                 let remoteContextMenuTargets = tabManager.tabs.filter { workspace in
                                     contextTargetIds.contains(workspace.id) && workspace.isRemoteWorkspace
                                 }
+                                let topLevelIndex = topLevelIds.firstIndex(of: tab.id)
+                                let shortcutDigit: Int? = topLevelIndex.flatMap {
+                                    WorkspaceShortcutMapper.commandDigitForWorkspace(
+                                        at: $0,
+                                        workspaceCount: topLevelIds.count
+                                    )
+                                }
                                 TabItemView(
                                     tabManager: tabManager,
                                     notificationStore: notificationStore,
                                     tab: tab,
                                     index: index,
                                     isActive: tabManager.selectedTabId == tab.id,
-                                    workspaceShortcutDigit: WorkspaceShortcutMapper.digitForWorkspace(
-                                        at: index,
-                                        workspaceCount: workspaceCount
-                                    ),
+                                    workspaceShortcutDigit: shortcutDigit,
                                     workspaceShortcutModifierSymbol: workspaceNumberShortcut.modifierDisplayString,
                                     canCloseWorkspace: canCloseWorkspace,
                                     accessibilityWorkspaceCount: workspaceCount,
