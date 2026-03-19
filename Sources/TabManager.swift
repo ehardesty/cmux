@@ -1192,7 +1192,8 @@ class TabManager: ObservableObject {
         portOrdinal: Int,
         configTemplate: ghostty_surface_config_s?,
         initialTerminalCommand: String?,
-        initialTerminalEnvironment: [String: String]
+        initialTerminalEnvironment: [String: String],
+        parentWorkspaceId: UUID? = nil
     ) -> Workspace {
         Workspace(
             title: title,
@@ -1200,7 +1201,8 @@ class TabManager: ObservableObject {
             portOrdinal: portOrdinal,
             configTemplate: configTemplate,
             initialTerminalCommand: initialTerminalCommand,
-            initialTerminalEnvironment: initialTerminalEnvironment
+            initialTerminalEnvironment: initialTerminalEnvironment,
+            parentWorkspaceId: parentWorkspaceId
         )
     }
 
@@ -1240,7 +1242,8 @@ class TabManager: ObservableObject {
         select: Bool = true,
         eagerLoadTerminal: Bool = false,
         placementOverride: NewWorkspacePlacement? = nil,
-        autoWelcomeIfNeeded: Bool = true
+        autoWelcomeIfNeeded: Bool = true,
+        parentWorkspaceId: UUID? = nil
     ) -> Workspace {
         let capturedTabs = tabs
         let capturedSelectedTabId = selectedTabId
@@ -1260,15 +1263,63 @@ class TabManager: ObservableObject {
 #endif
             let nextTabCount = snapshot.tabs.count + 1
             sentryBreadcrumb("workspace.create", data: ["tabCount": nextTabCount])
+
+            // Validate the requested parent and resolve nesting-specific overrides.
+            // Falls back to normal top-level creation if validation fails.
+            var resolvedParentId: UUID? = nil
+            var nestingInsertIndex: Int? = nil
+            var nestingWorkingDirectory: String? = nil
+            var nestingIsPinned: Bool = false
+            if let requestedParentId = parentWorkspaceId {
+                if let parent = snapshot.tabs.first(where: { $0.id == requestedParentId }) {
+                    if !parent.isTopLevel {
+                        // Parent is itself a child — cannot nest further.
+#if DEBUG
+                        dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent is already a child")
+#endif
+                    } else if parent.isRemoteWorkspace {
+                        // Remote workspaces cannot act as parents.
+#if DEBUG
+                        dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent is a remote workspace")
+#endif
+                    } else {
+                        // Validation passed — capture nesting parameters.
+                        resolvedParentId = requestedParentId
+                        nestingIsPinned = parent.isPinned
+
+                        // Inherit the parent's current directory as the working directory
+                        // (overrideWorkingDirectory is still respected if explicitly provided).
+                        if overrideWorkingDirectory == nil {
+                            let dir = parent.currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !dir.isEmpty {
+                                nestingWorkingDirectory = dir
+                            }
+                        }
+
+                        // Compute insertion index: after the last child of the parent,
+                        // or immediately after the parent if it has no children yet.
+                        let parentIndex = snapshot.tabs.firstIndex(where: { $0.id == requestedParentId }) ?? 0
+                        let lastChildIndex = snapshot.tabs.indices
+                            .filter { snapshot.tabs[$0].parentWorkspaceId == requestedParentId }
+                            .max()
+                        nestingInsertIndex = (lastChildIndex ?? parentIndex) + 1
+                    }
+                } else {
+#if DEBUG
+                    dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent not found in tabs")
+#endif
+                }
+            }
+
             let explicitWorkingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory)
+                ?? nestingWorkingDirectory.flatMap { normalizedWorkingDirectory($0) }
             let workingDirectory = explicitWorkingDirectory ?? snapshot.preferredWorkingDirectory
             let inheritedConfig = workspaceCreationConfigTemplate(
                 inheritedTerminalFontPoints: snapshot.inheritedTerminalFontPoints
             )
-            // Resolve placement against the pre-creation snapshot before Workspace init
-            // boots terminal state. The ssh/new-workspace path can otherwise crash while
-            // reading @Published placement state from existing workspaces mid-creation.
-            let insertIndex = newTabInsertIndex(snapshot: snapshot, placementOverride: placementOverride)
+            // Use nesting-specific insert index when creating a child workspace,
+            // bypassing the normal NewWorkspacePlacement logic.
+            let insertIndex = nestingInsertIndex ?? newTabInsertIndex(snapshot: snapshot, placementOverride: placementOverride)
             let ordinal = Self.nextPortOrdinal
             Self.nextPortOrdinal += 1
             let newWorkspace = makeWorkspaceForCreation(
@@ -1277,8 +1328,12 @@ class TabManager: ObservableObject {
                 portOrdinal: ordinal,
                 configTemplate: inheritedConfig,
                 initialTerminalCommand: initialTerminalCommand,
-                initialTerminalEnvironment: initialTerminalEnvironment
+                initialTerminalEnvironment: initialTerminalEnvironment,
+                parentWorkspaceId: resolvedParentId
             )
+            if resolvedParentId != nil {
+                newWorkspace.isPinned = nestingIsPinned
+            }
             newWorkspace.owningTabManager = self
             wireClosedBrowserTracking(for: newWorkspace)
             if eagerLoadTerminal && !select {
