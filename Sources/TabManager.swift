@@ -916,6 +916,14 @@ class TabManager: ObservableObject {
         return [workspace] + kids
     }
 
+    /// Resolves a workspace to its top-level parent.
+    /// If the workspace is already top-level, returns itself.
+    /// If the workspace is a child, returns its parent (or nil if the parent is missing from tabs).
+    func topLevelAncestor(of workspace: Workspace) -> Workspace? {
+        guard let parentId = workspace.parentWorkspaceId else { return workspace }
+        return tabs.first { $0.id == parentId }
+    }
+
     // MARK: - Agent PID Sweep
 
     /// Periodically checks agent PIDs associated with status entries.
@@ -2470,32 +2478,19 @@ class TabManager: ObservableObject {
     }
 
     func moveTabToTop(_ tabId: UUID) {
-        guard let workspace = tabs.first(where: { $0.id == tabId }) else { return }
-        let effectiveId: UUID
-        if let parentId = workspace.parentWorkspaceId {
-            effectiveId = parentId
-        } else {
-            effectiveId = tabId
-        }
+        guard let workspace = tabs.first(where: { $0.id == tabId }),
+              let ancestor = topLevelAncestor(of: workspace) else { return }
         let pinnedCount = tabs.filter(\.isPinned).count
-        moveGroup(workspaceId: effectiveId, toIndex: pinnedCount)
+        moveGroup(workspaceId: ancestor.id, toIndex: pinnedCount)
     }
 
     func moveTabsToTop(_ tabIds: Set<UUID>) {
         var expandedIds = tabIds
         for tabId in tabIds {
-            guard let workspace = tabs.first(where: { $0.id == tabId }) else { continue }
-            if let parentId = workspace.parentWorkspaceId {
-                if let parent = tabs.first(where: { $0.id == parentId }) {
-                    expandedIds.insert(parentId)
-                    for child in children(of: parent) {
-                        expandedIds.insert(child.id)
-                    }
-                }
-            } else {
-                for child in children(of: workspace) {
-                    expandedIds.insert(child.id)
-                }
+            guard let workspace = tabs.first(where: { $0.id == tabId }),
+                  let ancestor = topLevelAncestor(of: workspace) else { continue }
+            for member in workspaceGroup(ancestor) {
+                expandedIds.insert(member.id)
             }
         }
         let selected = tabs.filter { expandedIds.contains($0.id) }
@@ -2508,17 +2503,11 @@ class TabManager: ObservableObject {
     }
 
     func moveTabToTopForNotification(_ tabId: UUID) {
-        guard let workspace = tabs.first(where: { $0.id == tabId }) else { return }
-        let effectiveId: UUID
-        if let parentId = workspace.parentWorkspaceId {
-            effectiveId = parentId
-        } else {
-            effectiveId = tabId
-        }
-        guard let effectiveWorkspace = tabs.first(where: { $0.id == effectiveId }) else { return }
-        guard !effectiveWorkspace.isPinned else { return }
+        guard let workspace = tabs.first(where: { $0.id == tabId }),
+              let ancestor = topLevelAncestor(of: workspace),
+              !ancestor.isPinned else { return }
         let pinnedCount = tabs.filter(\.isPinned).count
-        moveGroup(workspaceId: effectiveId, toIndex: pinnedCount)
+        moveGroup(workspaceId: ancestor.id, toIndex: pinnedCount)
     }
 
     @discardableResult
@@ -2816,39 +2805,29 @@ class TabManager: ObservableObject {
     /// Returns the parent followed by its children in order, or nil if the workspace is not found.
     @discardableResult
     func detachWorkspaceGroup(tabId: UUID) -> [Workspace]? {
-        guard let workspace = tabs.first(where: { $0.id == tabId }) else { return nil }
-        // Resolve to effective parent if called with a child id
-        let effectiveParent: Workspace
-        if workspace.isChild {
-            guard let parentId = workspace.parentWorkspaceId,
-                  let parent = tabs.first(where: { $0.id == parentId }) else { return nil }
-            effectiveParent = parent
-        } else {
-            effectiveParent = workspace
-        }
+        guard let workspace = tabs.first(where: { $0.id == tabId }),
+              let effectiveParent = topLevelAncestor(of: workspace) else { return nil }
 
         let group = workspaceGroup(effectiveParent)
-        var detachedGroup: [Workspace] = []
-        var firstRemovedIndex: Int? = nil
+        let groupIds = Set(group.map(\.id))
+        let firstRemovedIndex = tabs.firstIndex(where: { groupIds.contains($0.id) })
 
+        var detachedGroup: [Workspace] = []
         for member in group {
-            guard let index = tabs.firstIndex(where: { $0.id == member.id }) else { continue }
-            if firstRemovedIndex == nil { firstRemovedIndex = index }
             clearWorkspaceGitProbes(workspaceId: member.id)
             sidebarSelectedWorkspaceIds.remove(member.id)
-            tabs.remove(at: tabs.firstIndex(where: { $0.id == member.id })!)
             unwireClosedBrowserTracking(for: member)
             member.owningTabManager = nil
             lastFocusedPanelByTab.removeValue(forKey: member.id)
             detachedGroup.append(member)
         }
+        tabs.removeAll { groupIds.contains($0.id) }
 
         if tabs.isEmpty {
             _ = addWorkspace()
             return detachedGroup
         }
 
-        let groupIds = Set(group.map(\.id))
         if let selectedId = selectedTabId, groupIds.contains(selectedId) {
             let fallbackIndex = min(firstRemovedIndex ?? 0, max(0, tabs.count - 1))
             selectedTabId = tabs[fallbackIndex].id
@@ -2998,10 +2977,8 @@ class TabManager: ObservableObject {
         var expandedIds = workspaceIds
         for id in workspaceIds {
             guard let workspace = tabs.first(where: { $0.id == id }) else { continue }
-            for child in children(of: workspace) {
-                if !expandedIds.contains(child.id) {
-                    expandedIds.append(child.id)
-                }
+            for child in children(of: workspace) where !expandedIds.contains(child.id) {
+                expandedIds.append(child.id)
             }
         }
 
