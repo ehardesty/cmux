@@ -904,6 +904,22 @@ class TabManager: ObservableObject {
         tabs.contains { $0.parentWorkspaceId == workspace.id }
     }
 
+    /// Expands a list of workspaces to include any children of top-level parents
+    /// that are not already in the list. Preserves order, appending children after their parent.
+    func expandWithChildren(_ workspaces: [Workspace]) -> [Workspace] {
+        let existingIds = Set(workspaces.map(\.id))
+        var expanded: [Workspace] = []
+        for workspace in workspaces {
+            expanded.append(workspace)
+            if workspace.isTopLevel {
+                for child in children(of: workspace) where !existingIds.contains(child.id) {
+                    expanded.append(child)
+                }
+            }
+        }
+        return expanded
+    }
+
     /// Returns the workspace and its children as a contiguous group (parent first, then children in order).
     /// For a child workspace, returns just that workspace.
     /// For a top-level workspace without children, returns just that workspace.
@@ -1242,6 +1258,69 @@ class TabManager: ObservableObject {
     }
 #endif
 
+    /// Resolved nesting parameters for creating a child workspace.
+    private struct NestingParams {
+        let parentId: UUID
+        let insertIndex: Int
+        let workingDirectory: String?
+        let isPinned: Bool
+    }
+
+    /// Validates and resolves nesting parameters for a new child workspace.
+    /// Returns nil if parentWorkspaceId is nil or validation fails (e.g., parent is itself a child,
+    /// parent is remote, or parent is not found).
+    private func resolveNestingParams(
+        parentWorkspaceId: UUID?,
+        overrideWorkingDirectory: String?,
+        snapshot: WorkspaceCreationSnapshot
+    ) -> NestingParams? {
+        guard let requestedParentId = parentWorkspaceId else { return nil }
+
+        guard let parent = snapshot.tabs.first(where: { $0.id == requestedParentId }) else {
+#if DEBUG
+            dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent not found in tabs")
+#endif
+            return nil
+        }
+
+        guard parent.isTopLevel else {
+#if DEBUG
+            dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent is already a child")
+#endif
+            return nil
+        }
+
+        guard !parent.isRemoteWorkspace else {
+#if DEBUG
+            dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent is a remote workspace")
+#endif
+            return nil
+        }
+
+        // Inherit the parent's current directory when no explicit override is provided
+        var workingDirectory: String? = nil
+        if overrideWorkingDirectory == nil {
+            let dir = parent.currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !dir.isEmpty {
+                workingDirectory = dir
+            }
+        }
+
+        // Insert after the last child of the parent, or immediately after the parent
+        let parentIndex = snapshot.tabs.firstIndex(where: { $0.id == requestedParentId }) ?? 0
+        let lastChildIndex = snapshot.tabs.indices
+            .filter { snapshot.tabs[$0].parentWorkspaceId == requestedParentId }
+            .max()
+        let insertIndex = (lastChildIndex ?? parentIndex) + 1
+
+        return NestingParams(
+            parentId: requestedParentId,
+            insertIndex: insertIndex,
+            workingDirectory: workingDirectory,
+            isPinned: parent.isPinned
+        )
+    }
+
     @discardableResult
     func addWorkspace(
         workingDirectory overrideWorkingDirectory: String? = nil,
@@ -1274,60 +1353,19 @@ class TabManager: ObservableObject {
 
             // Validate the requested parent and resolve nesting-specific overrides.
             // Falls back to normal top-level creation if validation fails.
-            var resolvedParentId: UUID? = nil
-            var nestingInsertIndex: Int? = nil
-            var nestingWorkingDirectory: String? = nil
-            var nestingIsPinned: Bool = false
-            if let requestedParentId = parentWorkspaceId {
-                if let parent = snapshot.tabs.first(where: { $0.id == requestedParentId }) {
-                    if !parent.isTopLevel {
-                        // Parent is itself a child — cannot nest further.
-#if DEBUG
-                        dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent is already a child")
-#endif
-                    } else if parent.isRemoteWorkspace {
-                        // Remote workspaces cannot act as parents.
-#if DEBUG
-                        dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent is a remote workspace")
-#endif
-                    } else {
-                        // Validation passed — capture nesting parameters.
-                        resolvedParentId = requestedParentId
-                        nestingIsPinned = parent.isPinned
-
-                        // Inherit the parent's current directory as the working directory
-                        // (overrideWorkingDirectory is still respected if explicitly provided).
-                        if overrideWorkingDirectory == nil {
-                            let dir = parent.currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !dir.isEmpty {
-                                nestingWorkingDirectory = dir
-                            }
-                        }
-
-                        // Compute insertion index: after the last child of the parent,
-                        // or immediately after the parent if it has no children yet.
-                        let parentIndex = snapshot.tabs.firstIndex(where: { $0.id == requestedParentId }) ?? 0
-                        let lastChildIndex = snapshot.tabs.indices
-                            .filter { snapshot.tabs[$0].parentWorkspaceId == requestedParentId }
-                            .max()
-                        nestingInsertIndex = (lastChildIndex ?? parentIndex) + 1
-                    }
-                } else {
-#if DEBUG
-                    dlog("addWorkspace: ignoring parentWorkspaceId \(requestedParentId) — parent not found in tabs")
-#endif
-                }
-            }
+            let nesting = resolveNestingParams(
+                parentWorkspaceId: parentWorkspaceId,
+                overrideWorkingDirectory: overrideWorkingDirectory,
+                snapshot: snapshot
+            )
 
             let explicitWorkingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory)
-                ?? nestingWorkingDirectory.flatMap { normalizedWorkingDirectory($0) }
+                ?? nesting?.workingDirectory.flatMap { normalizedWorkingDirectory($0) }
             let workingDirectory = explicitWorkingDirectory ?? snapshot.preferredWorkingDirectory
             let inheritedConfig = workspaceCreationConfigTemplate(
                 inheritedTerminalFontPoints: snapshot.inheritedTerminalFontPoints
             )
-            // Use nesting-specific insert index when creating a child workspace,
-            // bypassing the normal NewWorkspacePlacement logic.
-            let insertIndex = nestingInsertIndex ?? newTabInsertIndex(snapshot: snapshot, placementOverride: placementOverride)
+            let insertIndex = nesting?.insertIndex ?? newTabInsertIndex(snapshot: snapshot, placementOverride: placementOverride)
             let ordinal = Self.nextPortOrdinal
             Self.nextPortOrdinal += 1
             let newWorkspace = makeWorkspaceForCreation(
@@ -1337,10 +1375,10 @@ class TabManager: ObservableObject {
                 configTemplate: inheritedConfig,
                 initialTerminalCommand: initialTerminalCommand,
                 initialTerminalEnvironment: initialTerminalEnvironment,
-                parentWorkspaceId: resolvedParentId
+                parentWorkspaceId: nesting?.parentId
             )
-            if resolvedParentId != nil {
-                newWorkspace.isPinned = nestingIsPinned
+            if let nesting {
+                newWorkspace.isPinned = nesting.isPinned
             }
             newWorkspace.owningTabManager = self
             wireClosedBrowserTracking(for: newWorkspace)
@@ -2531,17 +2569,10 @@ class TabManager: ObservableObject {
             let insertAt = min(adjustedTarget, tabs.count)
             tabs.insert(workspace, at: insertAt)
             return true
-        } else if hasChildren(workspace) {
+        } else {
+            // Top-level workspace (with or without children): moveGroup handles both cases
             let clamped = clampedReorderIndex(for: workspace, targetIndex: targetIndex)
             moveGroup(workspaceId: tabId, toIndex: clamped)
-            return true
-        } else {
-            let clamped = clampedReorderIndex(for: workspace, targetIndex: targetIndex)
-            guard let currentIndex = tabs.firstIndex(where: { $0.id == tabId }),
-                  currentIndex != clamped else { return false }
-            tabs.remove(at: currentIndex)
-            let insertAt = min(clamped, tabs.count)
-            tabs.insert(workspace, at: insertAt)
             return true
         }
     }
@@ -2570,13 +2601,8 @@ class TabManager: ObservableObject {
         let group = workspaceGroup(workspace)
         let groupIds = Set(group.map(\.id))
 
-        // Remove all group members from tabs
         tabs.removeAll { groupIds.contains($0.id) }
-
-        // Clamp target index
         let clampedIndex = min(max(targetIndex, 0), tabs.count)
-
-        // Reinsert group at target position
         tabs.insert(contentsOf: group, at: clampedIndex)
 
         return tabs.firstIndex(where: { $0.id == workspaceId })
@@ -2625,7 +2651,7 @@ class TabManager: ObservableObject {
     }
 
     func setPinned(_ tab: Workspace, pinned: Bool) {
-        guard tab.isTopLevel else { return }
+        guard tab.isTopLevel, tab.isPinned != pinned else { return }
         tab.isPinned = pinned
         for child in children(of: tab) {
             child.isPinned = pinned
@@ -2776,16 +2802,13 @@ class TabManager: ObservableObject {
     func detachWorkspace(tabId: UUID) -> Workspace? {
         guard let workspace = tabs.first(where: { $0.id == tabId }) else { return nil }
 
-        // If this is a parent with children, un-nest all children first to prevent orphans
-        if !workspace.isChild {
+        // Clear all nesting relationships to prevent orphans
+        if workspace.isChild {
+            workspace.parentWorkspaceId = nil
+        } else {
             for child in children(of: workspace) {
                 child.parentWorkspaceId = nil
             }
-        }
-
-        // If this is a child, clear its parent relationship before detaching
-        if workspace.isChild {
-            workspace.parentWorkspaceId = nil
         }
 
         guard let index = tabs.firstIndex(where: { $0.id == tabId }) else { return nil }
@@ -2823,20 +2846,18 @@ class TabManager: ObservableObject {
         let groupIds = Set(group.map(\.id))
         let firstRemovedIndex = tabs.firstIndex(where: { groupIds.contains($0.id) })
 
-        var detachedGroup: [Workspace] = []
         for member in group {
             clearWorkspaceGitProbes(workspaceId: member.id)
             sidebarSelectedWorkspaceIds.remove(member.id)
             unwireClosedBrowserTracking(for: member)
             member.owningTabManager = nil
             lastFocusedPanelByTab.removeValue(forKey: member.id)
-            detachedGroup.append(member)
         }
         tabs.removeAll { groupIds.contains($0.id) }
 
         if tabs.isEmpty {
             _ = addWorkspace()
-            return detachedGroup
+            return group
         }
 
         if let selectedId = selectedTabId, groupIds.contains(selectedId) {
@@ -2844,7 +2865,7 @@ class TabManager: ObservableObject {
             selectedTabId = tabs[fallbackIndex].id
         }
 
-        return detachedGroup
+        return group
     }
 
     /// Attach an existing workspace to this window.
@@ -2984,15 +3005,8 @@ class TabManager: ObservableObject {
     }
 
     func closeWorkspacesWithConfirmation(_ workspaceIds: [UUID], allowPinned: Bool) {
-        // Expand the selection to include children of any selected parent workspace
-        var expandedIds = workspaceIds
-        for id in workspaceIds {
-            guard let workspace = tabs.first(where: { $0.id == id }) else { continue }
-            for child in children(of: workspace) where !expandedIds.contains(child.id) {
-                expandedIds.append(child.id)
-            }
-        }
-
+        let selectedWorkspaces = tabs.filter { workspaceIds.contains($0.id) }
+        let expandedIds = expandWithChildren(selectedWorkspaces).map(\.id)
         let workspaces = orderedClosableWorkspaces(expandedIds, allowPinned: allowPinned)
         guard !workspaces.isEmpty else { return }
         guard workspaces.count > 1 else {

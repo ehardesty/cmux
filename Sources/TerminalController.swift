@@ -4057,19 +4057,7 @@ class TerminalController {
                     return
                 }
                 let aboveCandidates = Array(tabManager.tabs.prefix(index)).filter { !$0.isPinned }
-                // Include children of any parent candidates that aren't already in the list,
-                // so that closing a parent also closes its children regardless of position.
-                var expandedAbove: [Workspace] = []
-                let aboveCandidateIds = Set(aboveCandidates.map(\.id))
-                for candidate in aboveCandidates {
-                    expandedAbove.append(candidate)
-                    if candidate.isTopLevel {
-                        for child in tabManager.children(of: candidate) where !aboveCandidateIds.contains(child.id) {
-                            expandedAbove.append(child)
-                        }
-                    }
-                }
-                let closed = closeWorkspaces(expandedAbove)
+                let closed = closeWorkspaces(tabManager.expandWithChildren(aboveCandidates))
                 finish(["closed": closed])
 
             case "close_below":
@@ -4083,19 +4071,7 @@ class TerminalController {
                 } else {
                     belowCandidates = []
                 }
-                // Include children of any parent candidates that aren't already in the list,
-                // so that closing a parent also closes its children regardless of position.
-                var expandedBelow: [Workspace] = []
-                let belowCandidateIds = Set(belowCandidates.map(\.id))
-                for candidate in belowCandidates {
-                    expandedBelow.append(candidate)
-                    if candidate.isTopLevel {
-                        for child in tabManager.children(of: candidate) where !belowCandidateIds.contains(child.id) {
-                            expandedBelow.append(child)
-                        }
-                    }
-                }
-                let closed = closeWorkspaces(expandedBelow)
+                let closed = closeWorkspaces(tabManager.expandWithChildren(belowCandidates))
                 finish(["closed": closed])
 
             case "mark_read":

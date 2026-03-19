@@ -8695,11 +8695,9 @@ struct VerticalTabsSidebar: View {
         canCloseWorkspace: Bool
     ) -> some View {
         let selectedContextIds: Set<UUID> = selectedTabIds.contains(tab.id) ? selectedTabIds : [tab.id]
-        let contextTargetIds = tabManager.tabs.compactMap { workspace in
-            selectedContextIds.contains(workspace.id) ? workspace.id : nil
-        }
+        let contextTargetIds = tabManager.tabs.filter { selectedContextIds.contains($0.id) }.map(\.id)
         let remoteContextMenuTargets = tabManager.tabs.filter { workspace in
-            contextTargetIds.contains(workspace.id) && workspace.isRemoteWorkspace
+            selectedContextIds.contains(workspace.id) && workspace.isRemoteWorkspace
         }
         let topLevelIndex = topLevelIds.firstIndex(of: tab.id)
         let shortcutDigit: Int? = topLevelIndex.flatMap {
