@@ -11706,13 +11706,15 @@ private struct TabItemView: View, Equatable {
             isMulti: isMulti)
         let renameWorkspaceShortcut = KeyboardShortcutSettings.shortcut(for: .renameWorkspace)
         let closeWorkspaceShortcut = KeyboardShortcutSettings.shortcut(for: .closeWorkspace)
-        Button(pinLabel) {
-            for id in targetIds {
-                if let tab = tabManager.tabs.first(where: { $0.id == id }) {
-                    tabManager.setPinned(tab, pinned: shouldPin)
+        if tab.isTopLevel {
+            Button(pinLabel) {
+                for id in targetIds {
+                    if let tab = tabManager.tabs.first(where: { $0.id == id }) {
+                        tabManager.setPinned(tab, pinned: shouldPin)
+                    }
                 }
+                syncSelectionAfterMutation()
             }
-            syncSelectionAfterMutation()
         }
 
         if let key = renameWorkspaceShortcut.keyEquivalent {
@@ -11729,6 +11731,14 @@ private struct TabItemView: View, Equatable {
         if tab.hasCustomTitle {
             Button(String(localized: "contextMenu.removeCustomWorkspaceName", defaultValue: "Remove Custom Workspace Name")) {
                 tabManager.clearCustomTitle(tabId: tab.id)
+            }
+        }
+
+        if tab.isTopLevel && !tab.isRemoteWorkspace {
+            Button {
+                tabManager.addWorkspace(parentWorkspaceId: tab.id)
+            } label: {
+                Text(String(localized: "sidebar.context.newNestedWorkspace", defaultValue: "New Nested Workspace"))
             }
         }
 
@@ -11805,6 +11815,14 @@ private struct TabItemView: View, Equatable {
             syncSelectionAfterMutation()
         }
         .disabled(targetIds.isEmpty)
+
+        if tab.isChild {
+            Button {
+                tabManager.unnestWorkspace(tab)
+            } label: {
+                Text(String(localized: "sidebar.context.moveToTopLevel", defaultValue: "Move to Top Level"))
+            }
+        }
 
         let referenceWindowId = AppDelegate.shared?.windowId(for: tabManager)
         let windowMoveTargets = AppDelegate.shared?.windowMoveTargets(referenceWindowId: referenceWindowId) ?? []

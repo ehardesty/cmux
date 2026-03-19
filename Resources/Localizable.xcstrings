@@ -1009,6 +1009,40 @@
         }
       }
     },
+    "sidebar.context.moveToTopLevel": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Move to Top Level"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "トップレベルに移動"
+          }
+        }
+      }
+    },
+    "sidebar.context.newNestedWorkspace": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "New Nested Workspace"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "新しいネストされたワークスペース"
+          }
+        }
+      }
+    },
     "sidebar.help.button": {
       "extractionState": "manual",
       "localizations": {
