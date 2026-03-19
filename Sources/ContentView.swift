@@ -11624,6 +11624,12 @@ private struct TabItemView: View, Equatable {
         ) { _ in
             workspaceObservationGeneration &+= 1
         }
+        .overlay {
+            if showsNestingHighlight {
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(cmuxAccentColor(), lineWidth: 2)
+            }
+        }
         .onDrag {
             #if DEBUG
             dlog("sidebar.onDrag tab=\(tab.id.uuidString.prefix(5))")
@@ -11959,6 +11965,11 @@ private struct TabItemView: View, Equatable {
             return false
         }
         return tabManager.tabs[currentIndex - 1].id == indicator.tabId
+    }
+
+    private var showsNestingHighlight: Bool {
+        guard draggedTabId != nil, let indicator = dropIndicator else { return false }
+        return indicator.tabId == tab.id && indicator.edge == .center
     }
 
     private var accessibilityTitle: String {
@@ -12748,6 +12759,7 @@ private struct SidebarMetadataMarkdownBlockRow: View {
 
 enum SidebarDropEdge {
     case top
+    case center
     case bottom
 }
 
@@ -12764,7 +12776,10 @@ enum SidebarDropPlanner {
         pinnedTabIds: Set<UUID>,
         parentIds: [UUID: UUID] = [:],
         pointerY: CGFloat? = nil,
-        targetHeight: CGFloat? = nil
+        targetHeight: CGFloat? = nil,
+        childTabIds: Set<UUID> = [],
+        parentTabIds: Set<UUID> = [],
+        remoteTabIds: Set<UUID> = []
     ) -> SidebarDropIndicator? {
         guard tabIds.count > 1, let draggedTabId else { return nil }
         guard let fromIndex = tabIds.firstIndex(of: draggedTabId) else { return nil }
@@ -12778,7 +12793,23 @@ enum SidebarDropPlanner {
             } else {
                 edge = preferredEdge(fromIndex: fromIndex, targetTabId: targetTabId, tabIds: tabIds)
             }
-            insertionPosition = (edge == .bottom) ? targetTabIndex + 1 : targetTabIndex
+
+            // Handle center edge: nesting drop
+            if edge == .center {
+                let draggedIsTopLevel = !childTabIds.contains(draggedTabId)
+                let draggedHasChildren = parentTabIds.contains(draggedTabId)
+                let targetIsTopLevel = !childTabIds.contains(targetTabId)
+                let targetIsRemote = remoteTabIds.contains(targetTabId)
+
+                if draggedIsTopLevel && !draggedHasChildren && targetIsTopLevel && !targetIsRemote {
+                    return SidebarDropIndicator(tabId: targetTabId, edge: .center)
+                }
+                // Fall through to nearest reorder edge
+                let fallbackEdge = preferredEdge(fromIndex: fromIndex, targetTabId: targetTabId, tabIds: tabIds)
+                insertionPosition = (fallbackEdge == .bottom) ? targetTabIndex + 1 : targetTabIndex
+            } else {
+                insertionPosition = (edge == .bottom) ? targetTabIndex + 1 : targetTabIndex
+            }
         } else {
             insertionPosition = tabIds.count
         }
@@ -12841,6 +12872,7 @@ enum SidebarDropPlanner {
     }
 
     private static func insertionPositionForIndicator(_ indicator: SidebarDropIndicator, tabIds: [UUID]) -> Int? {
+        if indicator.edge == .center { return nil }
         if let tabId = indicator.tabId {
             guard let targetTabIndex = tabIds.firstIndex(of: tabId) else { return nil }
             return indicator.edge == .bottom ? targetTabIndex + 1 : targetTabIndex
@@ -12972,7 +13004,14 @@ enum SidebarDropPlanner {
     static func edgeForPointer(locationY: CGFloat, targetHeight: CGFloat) -> SidebarDropEdge {
         guard targetHeight > 0 else { return .top }
         let clampedY = min(max(locationY, 0), targetHeight)
-        return clampedY < (targetHeight / 2) ? .top : .bottom
+        let ratio = clampedY / targetHeight
+        if ratio < 0.25 {
+            return .top
+        } else if ratio > 0.75 {
+            return .bottom
+        } else {
+            return .center
+        }
     }
 
     private static func resolvedTargetIndex(from sourceIndex: Int, insertionPosition: Int, totalCount: Int) -> Int {
@@ -13349,6 +13388,40 @@ private struct SidebarTabDropDelegate: DropDelegate {
         let tabs = tabManager.tabs
         let tabIds = tabs.map(\.id)
         let parentIds = parentIdsMap(from: tabs)
+
+        // Handle nesting drop (center indicator)
+        if let indicator = dropIndicator,
+           indicator.edge == .center,
+           let nestTargetId = indicator.tabId,
+           let draggedWorkspace = tabs.first(where: { $0.id == draggedTabId }),
+           let nestTarget = tabs.first(where: { $0.id == nestTargetId }),
+           draggedWorkspace.isTopLevel,
+           !tabManager.hasChildren(draggedWorkspace),
+           nestTarget.isTopLevel,
+           !nestTarget.isRemoteWorkspace {
+#if DEBUG
+            dlog(
+                "sidebar.drop.nest tab=\(draggedTabId.uuidString.prefix(5)) " +
+                "under=\(nestTargetId.uuidString.prefix(5))"
+            )
+#endif
+            draggedWorkspace.parentWorkspaceId = nestTargetId
+            draggedWorkspace.isPinned = nestTarget.isPinned
+            // Move to after the target's last child (or directly after the target if no existing children)
+            let targetIdx = tabIds.firstIndex(of: nestTargetId) ?? 0
+            let existingChildren = tabs.filter { $0.parentWorkspaceId == nestTargetId }
+            let insertAfter = targetIdx + existingChildren.count
+            _ = tabManager.reorderWorkspace(tabId: draggedTabId, toIndex: insertAfter + 1)
+            if let selectedId = tabManager.selectedTabId {
+                selectedTabIds = [selectedId]
+                syncSidebarSelection(preferredSelectedTabId: selectedId)
+            } else {
+                selectedTabIds = []
+                syncSidebarSelection()
+            }
+            return true
+        }
+
         guard let targetIndex = SidebarDropPlanner.targetIndex(
             draggedTabId: draggedTabId,
             targetTabId: targetTabId,
@@ -13430,6 +13503,9 @@ private struct SidebarTabDropDelegate: DropDelegate {
         let tabIds = tabs.map(\.id)
         let pinnedTabIds = Set(tabs.filter(\.isPinned).map(\.id))
         let parentIds = parentIdsMap(from: tabs)
+        let childTabIds = Set(tabs.filter { $0.isChild }.map(\.id))
+        let parentTabIds = Set(tabs.filter { tabManager.hasChildren($0) }.map(\.id))
+        let remoteTabIds = Set(tabs.filter { $0.isRemoteWorkspace }.map(\.id))
         dropIndicator = SidebarDropPlanner.indicator(
             draggedTabId: draggedTabId,
             targetTabId: targetTabId,
@@ -13437,7 +13513,10 @@ private struct SidebarTabDropDelegate: DropDelegate {
             pinnedTabIds: pinnedTabIds,
             parentIds: parentIds,
             pointerY: targetTabId == nil ? nil : info.location.y,
-            targetHeight: targetRowHeight
+            targetHeight: targetRowHeight,
+            childTabIds: childTabIds,
+            parentTabIds: parentTabIds,
+            remoteTabIds: remoteTabIds
         )
     }
 
@@ -13463,7 +13542,13 @@ private struct SidebarTabDropDelegate: DropDelegate {
     private func debugIndicator(_ indicator: SidebarDropIndicator?) -> String {
         guard let indicator else { return "nil" }
         let tabText = indicator.tabId.map { String($0.uuidString.prefix(5)) } ?? "end"
-        return "\(tabText):\(indicator.edge == .top ? "top" : "bottom")"
+        let edgeText: String
+        switch indicator.edge {
+        case .top: edgeText = "top"
+        case .center: edgeText = "center"
+        case .bottom: edgeText = "bottom"
+        }
+        return "\(tabText):\(edgeText)"
     }
 }
 
