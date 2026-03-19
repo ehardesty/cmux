@@ -2524,7 +2524,11 @@ class TabManager: ObservableObject {
             guard let currentIndex = tabs.firstIndex(where: { $0.id == tabId }),
                   currentIndex != clampedTarget else { return false }
             tabs.remove(at: currentIndex)
-            let insertAt = min(clampedTarget, tabs.count)
+            var adjustedTarget = clampedTarget
+            if currentIndex < clampedTarget {
+                adjustedTarget -= 1
+            }
+            let insertAt = min(adjustedTarget, tabs.count)
             tabs.insert(workspace, at: insertAt)
             return true
         } else if hasChildren(workspace) {
@@ -2771,6 +2775,13 @@ class TabManager: ObservableObject {
     @discardableResult
     func detachWorkspace(tabId: UUID) -> Workspace? {
         guard let workspace = tabs.first(where: { $0.id == tabId }) else { return nil }
+
+        // If this is a parent with children, un-nest all children first to prevent orphans
+        if !workspace.isChild {
+            for child in children(of: workspace) {
+                child.parentWorkspaceId = nil
+            }
+        }
 
         // If this is a child, clear its parent relationship before detaching
         if workspace.isChild {
