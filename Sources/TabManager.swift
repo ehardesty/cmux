@@ -881,6 +881,41 @@ class TabManager: ObservableObject {
         workspaceGitMetadataPollTimer?.cancel()
     }
 
+    // MARK: - Workspace Group Helpers
+
+    /// Returns child workspaces of the given workspace, in tabs-array order.
+    func children(of workspace: Workspace) -> [Workspace] {
+        tabs.filter { $0.parentWorkspaceId == workspace.id }
+    }
+
+    /// Returns only top-level workspaces (those without a parent).
+    func topLevelWorkspaces() -> [Workspace] {
+        tabs.filter { $0.isTopLevel }
+    }
+
+    /// Returns the parent workspace for a child, or nil if top-level.
+    func parent(of workspace: Workspace) -> Workspace? {
+        guard let parentId = workspace.parentWorkspaceId else { return nil }
+        return tabs.first { $0.id == parentId }
+    }
+
+    /// Returns true if the workspace has any children.
+    func hasChildren(_ workspace: Workspace) -> Bool {
+        tabs.contains { $0.parentWorkspaceId == workspace.id }
+    }
+
+    /// Returns the workspace and its children as a contiguous group (parent first, then children in order).
+    /// For a child workspace, returns just that workspace.
+    /// For a top-level workspace without children, returns just that workspace.
+    /// Note: collects children by parentWorkspaceId regardless of contiguity in tabs array,
+    /// so this method self-heals if the adjacency invariant is transiently broken.
+    func workspaceGroup(_ workspace: Workspace) -> [Workspace] {
+        if workspace.isChild { return [workspace] }
+        let kids = children(of: workspace)
+        if kids.isEmpty { return [workspace] }
+        return [workspace] + kids
+    }
+
     // MARK: - Agent PID Sweep
 
     /// Periodically checks agent PIDs associated with status entries.
@@ -2380,34 +2415,55 @@ class TabManager: ObservableObject {
     }
 
     func moveTabToTop(_ tabId: UUID) {
-        guard let index = tabs.firstIndex(where: { $0.id == tabId }) else { return }
-        guard index != 0 else { return }
-        let tab = tabs.remove(at: index)
-        let pinnedCount = tabs.filter { $0.isPinned }.count
-        let insertIndex = tab.isPinned ? 0 : pinnedCount
-        tabs.insert(tab, at: insertIndex)
+        guard let workspace = tabs.first(where: { $0.id == tabId }) else { return }
+        let effectiveId: UUID
+        if let parentId = workspace.parentWorkspaceId {
+            effectiveId = parentId
+        } else {
+            effectiveId = tabId
+        }
+        let pinnedCount = tabs.filter(\.isPinned).count
+        moveGroup(workspaceId: effectiveId, toIndex: pinnedCount)
     }
 
     func moveTabsToTop(_ tabIds: Set<UUID>) {
-        guard !tabIds.isEmpty else { return }
-        let selectedTabs = tabs.filter { tabIds.contains($0.id) }
-        guard !selectedTabs.isEmpty else { return }
-        let remainingTabs = tabs.filter { !tabIds.contains($0.id) }
-        let selectedPinned = selectedTabs.filter { $0.isPinned }
-        let selectedUnpinned = selectedTabs.filter { !$0.isPinned }
-        let remainingPinned = remainingTabs.filter { $0.isPinned }
-        let remainingUnpinned = remainingTabs.filter { !$0.isPinned }
+        var expandedIds = tabIds
+        for tabId in tabIds {
+            guard let workspace = tabs.first(where: { $0.id == tabId }) else { continue }
+            if let parentId = workspace.parentWorkspaceId {
+                if let parent = tabs.first(where: { $0.id == parentId }) {
+                    expandedIds.insert(parentId)
+                    for child in children(of: parent) {
+                        expandedIds.insert(child.id)
+                    }
+                }
+            } else {
+                for child in children(of: workspace) {
+                    expandedIds.insert(child.id)
+                }
+            }
+        }
+        let selected = tabs.filter { expandedIds.contains($0.id) }
+        let remaining = tabs.filter { !expandedIds.contains($0.id) }
+        let selectedPinned = selected.filter(\.isPinned)
+        let remainingPinned = remaining.filter(\.isPinned)
+        let selectedUnpinned = selected.filter { !$0.isPinned }
+        let remainingUnpinned = remaining.filter { !$0.isPinned }
         tabs = selectedPinned + remainingPinned + selectedUnpinned + remainingUnpinned
     }
 
     func moveTabToTopForNotification(_ tabId: UUID) {
-        guard let index = tabs.firstIndex(where: { $0.id == tabId }) else { return }
-        let pinnedCount = tabs.filter { $0.isPinned }.count
-        guard index != pinnedCount else { return }
-        let tab = tabs[index]
-        guard !tab.isPinned else { return }
-        tabs.remove(at: index)
-        tabs.insert(tab, at: pinnedCount)
+        guard let workspace = tabs.first(where: { $0.id == tabId }) else { return }
+        let effectiveId: UUID
+        if let parentId = workspace.parentWorkspaceId {
+            effectiveId = parentId
+        } else {
+            effectiveId = tabId
+        }
+        guard let effectiveWorkspace = tabs.first(where: { $0.id == effectiveId }) else { return }
+        guard !effectiveWorkspace.isPinned else { return }
+        let pinnedCount = tabs.filter(\.isPinned).count
+        moveGroup(workspaceId: effectiveId, toIndex: pinnedCount)
     }
 
     @discardableResult
@@ -2436,6 +2492,47 @@ class TabManager: ObservableObject {
             return reorderWorkspace(tabId: tabId, toIndex: idx + 1)
         }
         return false
+    }
+
+    /// Atomically moves a workspace group (parent + children) to a target index.
+    /// If the workspace is a top-level parent with children, moves the entire group.
+    /// If the workspace has no children, moves just that workspace.
+    /// Returns the new index of the workspace after the move.
+    @discardableResult
+    private func moveGroup(workspaceId: UUID, toIndex targetIndex: Int) -> Int? {
+        guard let workspace = tabs.first(where: { $0.id == workspaceId }) else { return nil }
+        let group = workspaceGroup(workspace)
+        let groupIds = Set(group.map(\.id))
+
+        // Remove all group members from tabs
+        tabs.removeAll { groupIds.contains($0.id) }
+
+        // Clamp target index
+        let clampedIndex = min(max(targetIndex, 0), tabs.count)
+
+        // Reinsert group at target position
+        tabs.insert(contentsOf: group, at: clampedIndex)
+
+        return tabs.firstIndex(where: { $0.id == workspaceId })
+    }
+
+    /// Un-nests a child workspace, making it top-level.
+    /// Inherits the parent's isPinned state and places according to NewWorkspacePlacement setting.
+    func unnestWorkspace(_ workspace: Workspace) {
+        guard workspace.isChild else { return }
+        if let parentWorkspace = parent(of: workspace) {
+            workspace.isPinned = parentWorkspace.isPinned
+        }
+        workspace.parentWorkspaceId = nil
+
+        // Remove and reinsert at placement position
+        guard let currentIndex = tabs.firstIndex(where: { $0.id == workspace.id }) else { return }
+        tabs.remove(at: currentIndex)
+
+        let snapshot = workspaceCreationSnapshot()
+        let insertIndex = newTabInsertIndex(snapshot: snapshot, placementOverride: nil)
+        let clampedIndex = min(insertIndex, tabs.count)
+        tabs.insert(workspace, at: clampedIndex)
     }
 
     func setCustomTitle(tabId: UUID, title: String?) {

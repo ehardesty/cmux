@@ -5374,12 +5374,18 @@ final class Workspace: Identifiable, ObservableObject {
     @Published var title: String
     @Published var customTitle: String?
     @Published var isPinned: Bool = false
+    @Published var parentWorkspaceId: UUID?
     @Published var customColor: String?  // hex string, e.g. "#C0392B"
     @Published var currentDirectory: String
     private(set) var preferredBrowserProfileID: UUID?
 
     /// Ordinal for CMUX_PORT range assignment (monotonically increasing per app session)
     var portOrdinal: Int = 0
+
+    /// Whether this workspace is nested inside another workspace.
+    var isChild: Bool { parentWorkspaceId != nil }
+    /// Whether this workspace is a top-level (non-nested) workspace.
+    var isTopLevel: Bool { parentWorkspaceId == nil }
 
     /// The bonsplit controller managing the split panes for this workspace
     let bonsplitController: BonsplitController
@@ -5641,10 +5647,12 @@ final class Workspace: Identifiable, ObservableObject {
         portOrdinal: Int = 0,
         configTemplate: ghostty_surface_config_s? = nil,
         initialTerminalCommand: String? = nil,
-        initialTerminalEnvironment: [String: String] = [:]
+        initialTerminalEnvironment: [String: String] = [:],
+        parentWorkspaceId: UUID? = nil
     ) {
         self.id = UUID()
         self.portOrdinal = portOrdinal
+        self.parentWorkspaceId = parentWorkspaceId
         self.processTitle = title
         self.title = title
         self.customTitle = nil
