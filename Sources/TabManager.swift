@@ -5749,8 +5749,14 @@ extension TabManager {
         let restorableTabs = tabs
             .filter { !$0.isRemoteWorkspace }
             .prefix(SessionPersistencePolicy.maxWorkspacesPerWindow)
-        let workspaceSnapshots = restorableTabs
+        var workspaceSnapshots = restorableTabs
             .map { $0.sessionSnapshot(includeScrollback: includeScrollback) }
+        for (index, tab) in restorableTabs.enumerated() {
+            if let parentId = tab.parentWorkspaceId,
+               let parentIndex = restorableTabs.firstIndex(where: { $0.id == parentId }) {
+                workspaceSnapshots[index].parentWorkspaceIndex = parentIndex
+            }
+        }
         let selectedWorkspaceIndex = selectedTabId.flatMap { selectedTabId in
             restorableTabs.firstIndex(where: { $0.id == selectedTabId })
         }
@@ -5812,6 +5818,15 @@ extension TabManager {
             workspace.restoreSessionSnapshot(workspaceSnapshot)
             wireClosedBrowserTracking(for: workspace)
             newTabs.append(workspace)
+        }
+
+        for (index, workspaceSnapshot) in snapshot.workspaces.enumerated() {
+            guard index < newTabs.count else { break }
+            if let parentIndex = workspaceSnapshot.parentWorkspaceIndex,
+               parentIndex >= 0, parentIndex < newTabs.count,
+               parentIndex != index {
+                newTabs[index].parentWorkspaceId = newTabs[parentIndex].id
+            }
         }
 
         if newTabs.isEmpty {

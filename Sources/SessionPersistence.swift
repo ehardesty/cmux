@@ -340,6 +340,7 @@ struct SessionWorkspaceSnapshot: Codable, Sendable {
     var logEntries: [SessionLogEntrySnapshot]
     var progress: SessionProgressSnapshot?
     var gitBranch: SessionGitBranchSnapshot?
+    var parentWorkspaceIndex: Int?  // index into the workspaces array pointing to parent
 }
 
 struct SessionTabManagerSnapshot: Codable, Sendable {
