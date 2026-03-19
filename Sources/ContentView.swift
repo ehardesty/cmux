@@ -12871,7 +12871,7 @@ enum SidebarDropPlanner {
         return SidebarDropIndicator(tabId: tabIds[clampedInsertion], edge: .top)
     }
 
-    private static func insertionPositionForIndicator(_ indicator: SidebarDropIndicator, tabIds: [UUID]) -> Int? {
+    static func insertionPositionForIndicator(_ indicator: SidebarDropIndicator, tabIds: [UUID]) -> Int? {
         if indicator.edge == .center { return nil }
         if let tabId = indicator.tabId {
             guard let targetTabIndex = tabIds.firstIndex(of: tabId) else { return nil }
@@ -13449,6 +13449,9 @@ private struct SidebarTabDropDelegate: DropDelegate {
 
         // Detect if a child workspace is being dropped outside its parent's group range,
         // which means the user intends to un-nest it.
+        // Use the raw insertion position (before resolvedTargetIndex adjustment) to detect
+        // intent, because resolvedTargetIndex adjusts for source removal and can map an
+        // "after the group" drop back to the child's current position.
         if let draggedWorkspace = tabs.first(where: { $0.id == draggedTabId }),
            draggedWorkspace.isChild,
            let parentId = draggedWorkspace.parentWorkspaceId,
@@ -13456,7 +13459,18 @@ private struct SidebarTabDropDelegate: DropDelegate {
             let siblings = tabs.filter { $0.parentWorkspaceId == parentId }
             let groupStart = parentIndex + 1
             let groupEnd = parentIndex + siblings.count
-            let isOutsideGroup = targetIndex < groupStart || targetIndex > groupEnd
+            // Compute the raw insertion position the user intended (before source-removal adjustment)
+            let rawInsertionPosition: Int
+            if let indicator = dropIndicator,
+               let indicatorInsertion = SidebarDropPlanner.insertionPositionForIndicator(indicator, tabIds: tabIds) {
+                rawInsertionPosition = indicatorInsertion
+            } else if let targetTabId {
+                let targetTabIndex = tabIds.firstIndex(of: targetTabId) ?? 0
+                rawInsertionPosition = (fromIndex < targetTabIndex) ? targetTabIndex + 1 : targetTabIndex
+            } else {
+                rawInsertionPosition = tabIds.count
+            }
+            let isOutsideGroup = rawInsertionPosition <= groupStart || rawInsertionPosition > groupEnd
             if isOutsideGroup {
 #if DEBUG
                 dlog(
